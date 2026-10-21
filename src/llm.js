@@ -58,14 +58,15 @@ export async function triageMessage(messageText) {
 }
 
 /**
- * Picks which (if any) of the candidate issues is a duplicate of the new report.
- * @returns {Promise<number | null>} the duplicate's issue number, or null if none.
+ * Picks which (if any) of the candidate issues / pull requests already covers the new report.
+ * @returns {Promise<number | null>} the match's number, or null if none.
  */
 export async function findDuplicate(triage, candidates) {
   const candidateText = candidates
     .map(
-      (issue) =>
-        `<issue number="${issue.number}">\nTitle: ${issue.title}\n\n${(issue.body ?? "").slice(0, 1500)}\n</issue>`,
+      (item) =>
+        `<candidate number="${item.number}" kind="${item.kind}" state="${item.state}">\n` +
+        `Title: ${item.title}\n\n${(item.body ?? "").slice(0, 1500)}\n</candidate>`,
     )
     .join("\n\n");
 
@@ -76,5 +77,5 @@ export async function findDuplicate(triage, candidates) {
   const result = await askForJson(DEDUPE_SYSTEM_PROMPT, content, DEDUPE_SCHEMA, 4000);
   const number = result?.duplicate_issue_number ?? 0;
   // Guard against the model returning a number that wasn't in the candidate list.
-  return candidates.some((issue) => issue.number === number) ? number : null;
+  return candidates.some((item) => item.number === number) ? number : null;
 }

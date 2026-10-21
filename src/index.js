@@ -1,10 +1,13 @@
 // ODS triage bot.
 //
+// Background: the fork (GITHUB_FORK_REPO) is synced from upstream every
+// SYNC_INTERVAL_MINUTES, and again whenever a bug report comes in.
+//
 // Flow for each message posted in ERROR_CHANNEL_ID:
 //   1. Claude decides whether it describes a real bug. If not, drop it silently.
-//   2. Search the repo's open GitHub issues for duplicates; Claude picks the match.
-//   3. Duplicate found  -> DM the reporter a link to the existing issue.
-//      No duplicate     -> DM the maintainer a ready-to-copy issue draft.
+//   2. Sync the fork, and search upstream's issues and pull requests; Claude picks the match.
+//   3. Match found  -> DM the reporter a link (open issue, fix in progress, or already fixed).
+//      No match     -> DM the maintainer a ready-to-copy issue draft.
 import {
   AttachmentBuilder,
   Client,
@@ -13,14 +16,16 @@ import {
   RESTJSONErrorCodes,
 } from "discord.js";
 import { triageMessage, findDuplicate } from "./llm.js";
-import { searchOpenIssues, newIssueUrl } from "./github.js";
+import { getUpstreamRepo, searchIssuesAndPulls, newIssueUrl } from "./github.js";
+import { startForkSync, syncNow } from "./fork-sync.js";
 
 const REQUIRED_ENV = [
   "DISCORD_TOKEN",
   "ERROR_CHANNEL_ID",
   "MAINTAINER_USER_ID",
   "ANTHROPIC_API_KEY",
-  "GITHUB_REPO",
+  "GITHUB_TOKEN",
+  "GITHUB_FORK_REPO",
 ];
 const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
 if (missing.length > 0) {
@@ -28,7 +33,12 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-const { DISCORD_TOKEN, ERROR_CHANNEL_ID, MAINTAINER_USER_ID, GITHUB_REPO } = process.env;
+const { DISCORD_TOKEN, ERROR_CHANNEL_ID, MAINTAINER_USER_ID, GITHUB_FORK_REPO } = process.env;
+const FORK_BRANCH = process.env.FORK_BRANCH || "main";
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MINUTES || 10) * 60_000;
+// Resolved at startup from GITHUB_UPSTREAM_REPO, or from the fork's parent on GitHub.
+let upstreamRepo = process.env.GITHUB_UPSTREAM_REPO;
+
 const DISCORD_MESSAGE_LIMIT = 2000;
 // GitHub accepts long URLs, but browsers and Discord get unreliable past ~8k chars.
 const MAX_PREFILL_URL_LENGTH = 6000;
@@ -42,14 +52,20 @@ const client = new Client({
   ],
 });
 
-client.once(Events.ClientReady, (c) => {
-  console.log(`Logged in as ${c.user.tag}; watching channel ${ERROR_CHANNEL_ID}`);
+client.once(Events.ClientReady, async (c) => {
+  upstreamRepo ??= await getUpstreamRepo(GITHUB_FORK_REPO);
+  console.log(
+    `Logged in as ${c.user.tag}; watching channel ${ERROR_CHANNEL_ID}. ` +
+      `Fork ${GITHUB_FORK_REPO}:${FORK_BRANCH} tracks ${upstreamRepo}.`,
+  );
+  startForkSync(GITHUB_FORK_REPO, FORK_BRANCH, SYNC_INTERVAL_MS, notifySyncStatus);
 });
 
 client.on(Events.MessageCreate, async (message) => {
   // Ignore ourselves, other bots/webhooks, and every channel but the error channel.
   if (message.author.bot || message.webhookId) return;
   if (message.channelId !== ERROR_CHANNEL_ID) return;
+  if (!upstreamRepo) return; // Still starting up.
 
   const rawText = buildRawText(message);
   if (!rawText) return;
@@ -67,30 +83,32 @@ async function handleReport(message, rawText) {
   if (!triage?.is_bug) return; // Not a bug (or the model declined): drop silently.
   console.log(`[triage] Bug detected in ${message.id}: ${triage.bug_title}`);
 
-  // --- 2. GitHub duplicate check -------------------------------------------
-  let duplicate = null;
+  // --- 2. Sync the fork + search upstream issues and PRs --------------------
+  const syncPromise = syncNow(GITHUB_FORK_REPO, FORK_BRANCH);
+  let match = null;
   let searchFailed = false;
   try {
-    const candidates = await searchOpenIssues(GITHUB_REPO, triage.search_query);
+    const candidates = await searchIssuesAndPulls(upstreamRepo, triage.search_query);
     if (candidates.length > 0) {
       const number = await findDuplicate(triage, candidates);
-      duplicate = candidates.find((issue) => issue.number === number) ?? null;
+      match = candidates.find((item) => item.number === number) ?? null;
     }
   } catch (err) {
     // Don't lose the report if GitHub is down; draft it and flag the failure.
     console.error("[github] Duplicate search failed:", err);
     searchFailed = true;
   }
+  const syncResult = await syncPromise;
 
-  // --- 3a. Known issue: thank the reporter ---------------------------------
-  if (duplicate) {
-    console.log(`[triage] ${message.id} matches #${duplicate.number}`);
-    await notifyReporter(message, duplicate);
+  // --- 3a. Already known upstream: tell the reporter -----------------------
+  if (match) {
+    console.log(`[triage] ${message.id} matches ${match.kind} #${match.number} (${match.state})`);
+    await notifyReporter(message, match);
     return;
   }
 
-  // --- 3b. New issue: send the maintainer a draft --------------------------
-  await notifyMaintainer(message, triage, rawText, searchFailed);
+  // --- 3b. New bug: send the maintainer a draft -----------------------------
+  await notifyMaintainer(message, triage, rawText, { searchFailed, syncResult });
 }
 
 /** The message text plus links to any attached files (logs, screenshots). */
@@ -102,12 +120,23 @@ function buildRawText(message) {
   return parts.filter(Boolean).join("\n");
 }
 
-async function notifyReporter(message, issue) {
-  const text =
-    `Thanks for reporting this in **#${message.channel.name}**! ` +
-    `It's a known issue that we're already tracking here:\n` +
-    `**#${issue.number}: ${issue.title}**\n${issue.url}\n\n` +
-    `Feel free to add your details or a 👍 on the issue so we can prioritize it.`;
+async function notifyReporter(message, match) {
+  const link = `**#${match.number}: ${match.title}**\n${match.url}`;
+  let text;
+  if (match.kind === "pull request" && match.state === "merged") {
+    text =
+      `Thanks for reporting this! It looks like it's **already fixed** by:\n${link}\n\n` +
+      `Updating to the latest version should resolve it. If it still happens after updating, ` +
+      `please post again with the new details.`;
+  } else if (match.kind === "pull request") {
+    text =
+      `Thanks for reporting this! A **fix is already in progress** here:\n${link}\n\n` +
+      `It should land once that pull request is merged.`;
+  } else {
+    text =
+      `Thanks for reporting this! It's a **known issue** that's already being tracked here:\n${link}\n\n` +
+      `Feel free to add your details or a 👍 on the issue so it gets prioritized.`;
+  }
 
   try {
     await message.author.send(text);
@@ -115,7 +144,7 @@ async function notifyReporter(message, issue) {
     // The user has DMs from server members turned off; reply in the channel instead.
     if (err.code === RESTJSONErrorCodes.CannotSendMessagesToThisUser) {
       await message.reply({
-        content: `This looks like a known issue: **#${issue.number}** ${issue.url} — thanks for the report!`,
+        content: `This is already covered by ${match.kind} **#${match.number}** (${match.state}): ${match.url}`,
         allowedMentions: { repliedUser: false },
       });
     } else {
@@ -124,18 +153,19 @@ async function notifyReporter(message, issue) {
   }
 }
 
-async function notifyMaintainer(message, triage, rawText, searchFailed) {
+async function notifyMaintainer(message, triage, rawText, { searchFailed, syncResult }) {
   const draft = buildIssueDraft(message, triage, rawText);
 
   const header = [
     `🐞 **New bug report from ${message.author.tag}** — ${message.url}`,
     searchFailed
-      ? "⚠️ GitHub search failed, so this was **not** checked for duplicates."
-      : "No matching open issue was found.",
+      ? `⚠️ GitHub search failed, so this was **not** checked against ${upstreamRepo}.`
+      : `No matching issue or pull request found in ${upstreamRepo}.`,
+    describeSync(syncResult),
   ];
-  const prefillUrl = newIssueUrl(GITHUB_REPO, triage.bug_title, draft.body);
+  const prefillUrl = newIssueUrl(upstreamRepo, triage.bug_title, draft.body);
   if (prefillUrl.length <= MAX_PREFILL_URL_LENGTH) {
-    header.push(`[Open a pre-filled issue on GitHub](<${prefillUrl}>)`);
+    header.push(`[Open a pre-filled issue on ${upstreamRepo}](<${prefillUrl}>)`);
   }
 
   const maintainer = await client.users.fetch(MAINTAINER_USER_ID);
@@ -153,6 +183,31 @@ async function notifyMaintainer(message, triage, rawText, searchFailed) {
       files: [file],
     });
   }
+}
+
+/** One status line about the fork sync that ran alongside this report. */
+function describeSync(result) {
+  const branch = `\`${GITHUB_FORK_REPO}:${FORK_BRANCH}\``;
+  if (!result.ok) {
+    return `⚠️ Couldn't sync ${branch} from upstream (${result.message}); your fork may be behind.`;
+  }
+  if (result.mergeType === "none") {
+    return `✅ ${branch} is up to date with upstream.`;
+  }
+  return `🔄 ${branch} was behind and has just been synced from upstream. Pull locally and retest; it may already be fixed.`;
+}
+
+/** DMs the maintainer when background syncing starts failing or recovers. */
+async function notifySyncStatus(result) {
+  const maintainer = await client.users.fetch(MAINTAINER_USER_ID);
+  const branch = `\`${GITHUB_FORK_REPO}:${FORK_BRANCH}\``;
+  const text = result.ok
+    ? `✅ Fork sync recovered: ${branch} is syncing from ${upstreamRepo} again.`
+    : `⚠️ Fork sync failed for ${branch}: ${result.message}\n` +
+      (result.status === 409
+        ? "Your fork has commits that conflict with upstream. Resolve the conflict manually; I'll keep retrying."
+        : "I'll keep retrying and let you know when it recovers.");
+  await maintainer.send(text);
 }
 
 /**
