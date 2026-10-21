@@ -1,0 +1,17 @@
+{
+  "name": "ods-triage-bot",
+  "version": "1.0.0",
+  "description": "Discord triage bot for the ODS server: classifies error reports with Claude, de-duplicates against GitHub issues, and drafts new issues.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --env-file=.env src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.137.0",
+    "discord.js": "^14.27.0"
+  }
+}
